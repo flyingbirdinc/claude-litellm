@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""
+claude-litellm: Isolated LiteLLM Profile Manager & Launcher for Claude Code.
+
+Stores profiles in ~/.claude-litellm/profiles.json (chmod 600) and gives each
+profile its own isolated CLAUDE_CONFIG_DIR under ~/.claude-litellm/envs/<id>
+so your primary ~/.claude configuration is never modified or polluted.
+"""
+
+import getpass
+import json
+import os
+import re
+import shutil
+import ssl
+import sys
+import termios
+import tty
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+BASE_DIR = Path.home() / ".claude-litellm"
+PROFILES_FILE = BASE_DIR / "profiles.json"
+ENVS_DIR = BASE_DIR / "envs"
+MAIN_CLAUDE_DIR = Path.home() / ".claude"
+MAIN_CLAUDE_JSON = Path.home() / ".claude.json"
+
+
+# ─── ANSI Styling ────────────────────────────────────────────────────────────
+class Style:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    MAGENTA = "\033[35m"
+    BLUE = "\033[34m"
+    REVERSE = "\033[7m"
+
+
+def c(text: Any, *styles: str) -> str:
+    return "".join(styles) + str(text) + Style.RESET
+
+
+def clear_screen() -> None:
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+# ─── Storage & Security ──────────────────────────────────────────────────────
+def ensure_dirs() -> None:
+    BASE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ENVS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def load_store() -> Dict[str, Any]:
+    ensure_dirs()
+    if not PROFILES_FILE.exists():
+        return {"last_used_id": None, "profiles": []}
+    try:
+        with open(PROFILES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict) or "profiles" not in data:
+                return {"last_used_id": None, "profiles": []}
+            return data
+    except Exception as e:
+        print(c(f"Warning: Could not read profiles file ({e}). Starting with an empty store.", Style.YELLOW))
+        return {"last_used_id": None, "profiles": []}
+
+
+def save_store(store: Dict[str, Any]) -> None:
+    ensure_dirs()
+    tmp_file = PROFILES_FILE.with_suffix(".tmp")
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(store, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp_file, 0o600)
+    tmp_file.replace(PROFILES_FILE)
+    os.chmod(PROFILES_FILE, 0o600)
+
+
+def mask_key(api_key: str) -> str:
+    if not api_key:
+        return "(empty)"
+    if len(api_key) <= 8:
+        return api_key[:2] + "••••"
+    return f"{api_key[:4]}••••{api_key[-4:]}"
+
+
+def normalize_url(url: str) -> str:
+    url = url.strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url.rstrip("/")
+
+
+# ─── LiteLLM Server Model Discovery ─────────────────────────────────────────
+def fetch_litellm_models(server_url: str, api_key: str, timeout: float = 5.0) -> Tuple[List[str], Optional[str]]:
+    """Queries <server_url>/v1/models (or /models) to list available models."""
+    base = normalize_url(server_url)
+    if not base:
+        return [], "Server URL is empty."
+
+    endpoints = [f"{base}/v1/models", f"{base}/models"]
+    ctx = ssl.create_default_context()
+    # Respect custom CA bundle if user has NODE_EXTRA_CA_CERTS or SSL_CERT_FILE
+    ca_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("NODE_EXTRA_CA_CERTS")
+    if ca_file and os.path.exists(os.path.expanduser(ca_file)):
+        try:
+            ctx.load_verify_locations(os.path.expanduser(ca_file))
+        except Exception:
+            pass
+
+    last_err = None
+    for ep in endpoints:
+        req = urllib.request.Request(
+            ep,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "x-api-key": api_key,
+                "Accept": "application/json",
+                "User-Agent": "claude-litellm/1.0",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                body = json.loads(resp.read().decode("utf-8", errors="replace"))
+                models: List[str] = []
+                if isinstance(body, dict) and isinstance(body.get("data"), list):
+                    for item in body["data"]:
+                        if isinstance(item, dict) and item.get("id"):
+                            models.append(str(item["id"]))
+                elif isinstance(body, dict) and isinstance(body.get("models"), list):
+                    for item in body["models"]:
+                        if isinstance(item, str):
+                            models.append(item)
+                        elif isinstance(item, dict) and item.get("id"):
+                            models.append(str(item["id"]))
+                if models:
+                    return sorted(set(models)), None
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code} ({e.reason})"
+        except urllib.error.URLError as e:
+            last_err = f"Connection error: {e.reason}"
+        except Exception as e:
+            last_err = str(e)
+
+    return [], last_err or "Could not fetch model list."
+
+
+# ─── Raw Terminal Key Reader ─────────────────────────────────────────────────
+def read_key() -> str:
+    """Reads a single keypress or escape sequence (arrow keys) from stdin."""
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        return line.strip() if line else "q"
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            seq = sys.stdin.read(2)
+            if seq == "[A":
+                return "UP"
+            if seq == "[B":
+                return "DOWN"
+            if seq == "[C":
+                return "RIGHT"
+            if seq == "[D":
+                return "LEFT"
+            return "ESC"
+        if ch in ("\r", "\n"):
+            return "ENTER"
+        if ch == "\x03":  # Ctrl+C
+            raise KeyboardInterrupt
+        if ch == "\x04":  # Ctrl+D
+            return "q"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def prompt_input(label: str, default: str = "", required: bool = False, secret: bool = False) -> str:
+    """Prompts the user for a value with optional default and secret masking."""
+    while True:
+        default_hint = ""
+        if default:
+            shown = mask_key(default) if secret else default
+            default_hint = f" {c(f'[{shown}]', Style.DIM)}"
+
+        prompt_str = f"  {c('›', Style.CYAN, Style.BOLD)} {c(label, Style.BOLD)}{default_hint}: "
+        try:
+            if secret:
+                val = getpass.getpass(prompt_str).strip()
+            else:
+                val = input(prompt_str).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+
+        if not val and default:
+            return default
+        if not val and required:
+            print(c("    ! This field is required.", Style.RED))
+            continue
+        return val
+
+
+# ─── Profile Add / Edit Flows ────────────────────────────────────────────────
+def choose_model_interactive(server_url: str, api_key: str, current_model: str = "") -> str:
+    print(f"\n  {c('⟳', Style.CYAN)} Querying available models from server ({server_url})...")
+    models, err = fetch_litellm_models(server_url, api_key)
+
+    if models:
+        print(f"  {c('✓', Style.GREEN)} Found {c(len(models), Style.BOLD)} model(s) on server:")
+        for idx, m in enumerate(models, 1):
+            marker = c(" (current)", Style.GREEN) if m == current_model else ""
+            print(f"    {c(f'{idx:2d})', Style.CYAN)} {m}{marker}")
+        print(f"    {c(' 0)', Style.DIM)} No default model (select inside Claude via /model)")
+        print(f"    {c(' m)', Style.DIM)} Enter model name manually")
+
+        raw = prompt_input("Model number or name (Enter = keep/skip)", default=current_model, required=False)
+        if raw == "0":
+            return ""
+        if raw.lower() == "m":
+            return prompt_input("Model name", default=current_model, required=False)
+        if raw.isdigit():
+            choice_idx = int(raw) - 1
+            if 0 <= choice_idx < len(models):
+                return models[choice_idx]
+        return raw
+    else:
+        if err:
+            print(f"  {c('ℹ', Style.YELLOW)} Could not auto-fetch models ({err}). You can type a model name manually or leave blank.")
+        val = prompt_input("Default Model (optional, type '-' to clear)", default=current_model, required=False)
+        return "" if val == "-" else val
+
+
+def add_profile_flow(store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    print()
+    print(c("  ┌──────────────────────────────────────────────────────────┐", Style.CYAN))
+    print(c("  │               Add New LiteLLM Profile                    │", Style.CYAN, Style.BOLD))
+    print(c("  └──────────────────────────────────────────────────────────┘", Style.CYAN))
+
+    server_url = normalize_url(
+        prompt_input("LiteLLM Server URL (e.g. http://localhost:4000)", required=True)
+    )
+    if not server_url:
+        return None
+
+    default_name = re.sub(r"^https?://", "", server_url).split("/")[0]
+    name = prompt_input("Profile Name", default=default_name, required=True)
+
+    api_key = prompt_input("LiteLLM API Key (hidden input)", required=True, secret=True)
+    if not api_key:
+        return None
+
+    model = choose_model_interactive(server_url, api_key)
+
+    auth_mode_input = prompt_input(
+        "Auth Header Mode [1: ANTHROPIC_AUTH_TOKEN (Bearer - Recommended), 2: ANTHROPIC_API_KEY (x-api-key), 3: Both]",
+        default="1",
+    )
+    auth_mode_map = {"1": "auth_token", "2": "api_key", "3": "both"}
+    auth_mode = auth_mode_map.get(auth_mode_input.strip(), "auth_token")
+
+    profile = {
+        "id": str(uuid.uuid4())[:8],
+        "name": name,
+        "server_url": server_url,
+        "api_key": api_key,
+        "model": model,
+        "auth_mode": auth_mode,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    store["profiles"].append(profile)
+    store["last_used_id"] = profile["id"]
+    save_store(store)
+    print(f"\n  {c('✓', Style.GREEN, Style.BOLD)} Profile '{c(name, Style.BOLD)}' saved!")
+    return profile
+
+
+def edit_profile_flow(store: Dict[str, Any], profile: Dict[str, Any]) -> None:
+    print()
+    print(c("  ┌──────────────────────────────────────────────────────────┐", Style.YELLOW))
+    print(c(f"  │  Edit Profile: {profile['name'][:41]:<41} │", Style.YELLOW, Style.BOLD))
+    print(c("  └──────────────────────────────────────────────────────────┘", Style.YELLOW))
+    print(c("  (Press Enter on any field to keep its current value)\n", Style.DIM))
+
+    new_name = prompt_input("Profile Name", default=profile.get("name", ""), required=True)
+    new_url = normalize_url(
+        prompt_input("LiteLLM Server URL", default=profile.get("server_url", ""), required=True)
+    )
+    new_key = prompt_input(
+        "LiteLLM API Key (enter new key or press Enter to keep)",
+        default=profile.get("api_key", ""),
+        required=True,
+        secret=True,
+    )
+    new_model = choose_model_interactive(new_url, new_key, current_model=profile.get("model", ""))
+
+    current_auth = profile.get("auth_mode", "auth_token")
+    rev_map = {"auth_token": "1", "api_key": "2", "both": "3"}
+    auth_mode_input = prompt_input(
+        "Auth Header Mode [1: ANTHROPIC_AUTH_TOKEN (Bearer), 2: ANTHROPIC_API_KEY (x-api-key), 3: Both]",
+        default=rev_map.get(current_auth, "1"),
+    )
+    auth_mode_map = {"1": "auth_token", "2": "api_key", "3": "both"}
+
+    profile["name"] = new_name
+    profile["server_url"] = new_url
+    profile["api_key"] = new_key
+    profile["model"] = new_model
+    profile["auth_mode"] = auth_mode_map.get(auth_mode_input.strip(), current_auth)
+    profile["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    save_store(store)
+    print(f"\n  {c('✓', Style.GREEN, Style.BOLD)} Profile '{c(new_name, Style.BOLD)}' updated!")
+
+
+def delete_profile_flow(store: Dict[str, Any], profile: Dict[str, Any]) -> bool:
+    print()
+    confirm = prompt_input(
+        f"Are you sure you want to delete profile '{profile['name']}'? (y/N)",
+        default="n",
+    )
+    if confirm.lower() in ("y", "yes"):
+        pid = profile["id"]
+        store["profiles"] = [p for p in store["profiles"] if p.get("id") != pid]
+        if store.get("last_used_id") == pid:
+            store["last_used_id"] = store["profiles"][0]["id"] if store["profiles"] else None
+        save_store(store)
+        env_dir = ENVS_DIR / pid
+        if env_dir.exists():
+            shutil.rmtree(env_dir, ignore_errors=True)
+        print(f"  {c('✓', Style.GREEN)} Profile deleted.")
+        return True
+    return False
+
+
+# ─── Isolated Environment Preparation & Launch ──────────────────────────────
+def prepare_isolated_config_dir(profile: Dict[str, Any]) -> Path:
+    """
+    Prepares an isolated CLAUDE_CONFIG_DIR for the profile so ~/.claude is never
+    touched, while pre-seeding onboarding & directory trust so Claude starts cleanly.
+    """
+    pid = profile["id"]
+    iso_dir = ENVS_DIR / pid
+    iso_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    # 1. Seed .claude.json inside isolated CLAUDE_CONFIG_DIR
+    iso_claude_json = iso_dir / ".claude.json"
+    claude_state: Dict[str, Any] = {}
+    if iso_claude_json.exists():
+        try:
+            claude_state = json.loads(iso_claude_json.read_text(encoding="utf-8"))
+        except Exception:
+            claude_state = {}
+
+    # Copy non-sensitive onboarding & workspace trust flags from ~/.claude.json
+    if MAIN_CLAUDE_JSON.exists():
+        try:
+            main_state = json.loads(MAIN_CLAUDE_JSON.read_text(encoding="utf-8"))
+            for key in ("theme", "hasCompletedOnboarding", "lastOnboardingVersion", "installMethod"):
+                if key in main_state and key not in claude_state:
+                    claude_state[key] = main_state[key]
+            # Copy directory trust status so user doesn't get prompted on every folder
+            if isinstance(main_state.get("projects"), dict):
+                iso_projects = claude_state.setdefault("projects", {})
+                for proj_path, proj_data in main_state["projects"].items():
+                    if isinstance(proj_data, dict) and proj_path not in iso_projects:
+                        iso_projects[proj_path] = {
+                            "allowedTools": proj_data.get("allowedTools", []),
+                            "hasTrustDialogAccepted": proj_data.get("hasTrustDialogAccepted", True),
+                        }
+        except Exception:
+            pass
+
+    # Always ensure current working directory is trusted and onboarding is marked complete
+    claude_state["hasCompletedOnboarding"] = True
+    cwd_str = str(Path.cwd())
+    projects_map = claude_state.setdefault("projects", {})
+    if cwd_str not in projects_map:
+        projects_map[cwd_str] = {"allowedTools": [], "hasTrustDialogAccepted": True}
+    else:
+        projects_map[cwd_str]["hasTrustDialogAccepted"] = True
+
+    iso_claude_json.write_text(json.dumps(claude_state, indent=2), encoding="utf-8")
+
+    # 2. Seed settings.json inside isolated CLAUDE_CONFIG_DIR
+    iso_settings_file = iso_dir / "settings.json"
+    iso_settings: Dict[str, Any] = {}
+    if iso_settings_file.exists():
+        try:
+            iso_settings = json.loads(iso_settings_file.read_text(encoding="utf-8"))
+        except Exception:
+            iso_settings = {}
+
+    # Inherit theme / useAutoModeDuringPlan from main settings, NEVER inherit main 'model'
+    main_settings_file = MAIN_CLAUDE_DIR / "settings.json"
+    if main_settings_file.exists():
+        try:
+            ms = json.loads(main_settings_file.read_text(encoding="utf-8"))
+            for k in ("theme", "useAutoModeDuringPlan"):
+                if k in ms and k not in iso_settings:
+                    iso_settings[k] = ms[k]
+        except Exception:
+            pass
+
+    if profile.get("model"):
+        iso_settings["model"] = profile["model"]
+
+    iso_settings_file.write_text(json.dumps(iso_settings, indent=2), encoding="utf-8")
+
+    # 3. Symlink non-conflicting user assets (plugins, skills, commands, agents) from ~/.claude
+    for shared_dir_name in ("plugins", "skills", "commands", "agents"):
+        src = MAIN_CLAUDE_DIR / shared_dir_name
+        dst = iso_dir / shared_dir_name
+        if src.exists() and not dst.exists():
+            try:
+                dst.symlink_to(src)
+            except Exception:
+                pass
+
+    return iso_dir
+
+
+def find_claude_binary() -> str:
+    local_bin = Path.home() / ".local" / "bin" / "claude"
+    if local_bin.exists() and os.access(local_bin, os.X_OK):
+        return str(local_bin)
+    found = shutil.which("claude")
+    if found:
+        return found
+    print(c("Error: 'claude' binary was not found in ~/.local/bin or PATH!", Style.RED, Style.BOLD))
+    sys.exit(1)
+
+
+def launch_claude(store: Dict[str, Any], profile: Dict[str, Any], extra_args: List[str]) -> None:
+    store["last_used_id"] = profile["id"]
+    save_store(store)
+
+    iso_dir = prepare_isolated_config_dir(profile)
+    claude_bin = find_claude_binary()
+
+    # Build clean isolated environment
+    env = os.environ.copy()
+
+    # Strip any conflicting parent-shell Claude/Anthropic/Provider variables
+    vars_to_clear = [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "AGY_ADC_AUTH",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_CHILD_SESSION",
+    ]
+    for var in vars_to_clear:
+        env.pop(var, None)
+
+    # Set isolated config directory and LiteLLM connection vars
+    env["CLAUDE_CONFIG_DIR"] = str(iso_dir)
+    env["ANTHROPIC_BASE_URL"] = profile["server_url"]
+    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+
+    auth_mode = profile.get("auth_mode", "auth_token")
+    if auth_mode == "api_key":
+        env["ANTHROPIC_API_KEY"] = profile["api_key"]
+    elif auth_mode == "both":
+        env["ANTHROPIC_AUTH_TOKEN"] = profile["api_key"]
+        env["ANTHROPIC_API_KEY"] = profile["api_key"]
+    else:
+        # Default: ANTHROPIC_AUTH_TOKEN sends Authorization: Bearer <key>
+        env["ANTHROPIC_AUTH_TOKEN"] = profile["api_key"]
+
+    cmd = [claude_bin]
+    if profile.get("model"):
+        env["ANTHROPIC_MODEL"] = profile["model"]
+        if "--model" not in extra_args:
+            cmd.extend(["--model", profile["model"]])
+
+    cmd.extend(extra_args)
+
+    print()
+    print(c("  ╭──────────────────────────────────────────────────────────────╮", Style.GREEN))
+    print(
+        f"  {c('│', Style.GREEN)} {c('🚀 Launching Claude Code (Isolated LiteLLM Mode)', Style.BOLD, Style.GREEN):<69}{c('│', Style.GREEN)}"
+    )
+    print(
+        f"  {c('│', Style.GREEN)}  • Profile : {c(profile['name'], Style.BOLD):<56}{c('│', Style.GREEN)}"
+    )
+    print(
+        f"  {c('│', Style.GREEN)}  • Server  : {c(profile['server_url'], Style.CYAN):<56}{c('│', Style.GREEN)}"
+    )
+    model_label = profile.get("model") or "(Default / Server)"
+    print(
+        f"  {c('│', Style.GREEN)}  • Model   : {c(model_label, Style.YELLOW):<56}{c('│', Style.GREEN)}"
+    )
+    print(
+        f"  {c('│', Style.GREEN)}  • Config  : {c(str(iso_dir), Style.DIM):<56}{c('│', Style.GREEN)}"
+    )
+    print(c("  ╰──────────────────────────────────────────────────────────────╯", Style.GREEN))
+    print()
+
+    os.execvpe(claude_bin, cmd, env)
+
+
+# ─── Interactive TUI Menu ────────────────────────────────────────────────────
+def interactive_menu(store: Dict[str, Any], extra_args: List[str]) -> None:
+    # First run: if no profiles exist, immediately guide user to create one
+    if not store.get("profiles"):
+        clear_screen()
+        print(c("\n  ⚡ Welcome to claude-litellm!", Style.BOLD, Style.CYAN))
+        print(c("  No LiteLLM server profiles found yet. Let's create your first profile:", Style.DIM))
+        profile = add_profile_flow(store)
+        if not profile:
+            print(c("\n  No profile created. Exiting.", Style.YELLOW))
+            sys.exit(0)
+        launch_claude(store, profile, extra_args)
+        return
+
+    # Find initial selection index (last used profile)
+    profiles = store["profiles"]
+    selected_idx = 0
+    last_id = store.get("last_used_id")
+    for idx, p in enumerate(profiles):
+        if p.get("id") == last_id:
+            selected_idx = idx
+            break
+
+    status_msg = ""
+
+    while True:
+        profiles = store.get("profiles", [])
+        if not profiles:
+            profile = add_profile_flow(store)
+            if not profile:
+                sys.exit(0)
+            launch_claude(store, profile, extra_args)
+            return
+
+        if selected_idx >= len(profiles):
+            selected_idx = max(0, len(profiles) - 1)
+
+        clear_screen()
+        print()
+        print(c("  ╭──────────────────────────────────────────────────────────────────────────╮", Style.CYAN))
+        print(
+            f"  {c('│', Style.CYAN)}   {c('⚡ CLAUDE-LITELLM — Isolated Server & Profile Launcher', Style.BOLD, Style.CYAN)}                 {c('│', Style.CYAN)}"
+        )
+        print(c("  ╰──────────────────────────────────────────────────────────────────────────╯", Style.CYAN))
+
+        if extra_args:
+            print(f"  {c('Forwarded arguments:', Style.DIM)} {c(' '.join(extra_args), Style.YELLOW)}")
+
+        print(f"\n  {c('Saved LiteLLM Profiles:', Style.BOLD)} {c('(Use ↑/↓ arrows or 1-9 number keys to select)', Style.DIM)}\n")
+
+        for idx, p in enumerate(profiles):
+            is_sel = idx == selected_idx
+            is_last = p.get("id") == store.get("last_used_id")
+
+            num_badge = f"[{idx + 1}]"
+            name = p.get("name", "Unnamed")
+            url = p.get("server_url", "")
+            key_masked = mask_key(p.get("api_key", ""))
+            model = p.get("model") or "default"
+            last_tag = c(" ★ last used", Style.GREEN) if is_last else ""
+
+            if is_sel:
+                pointer = c("  ❯ ", Style.CYAN, Style.BOLD)
+                line_title = c(f"{num_badge} {name}", Style.BOLD, Style.CYAN) + last_tag
+                details = f"      {c('Server:', Style.DIM)} {c(url, Style.BOLD)}   {c('Key:', Style.DIM)} {key_masked}   {c('Model:', Style.DIM)} {c(model, Style.YELLOW)}"
+            else:
+                pointer = "    "
+                line_title = f"{c(num_badge, Style.DIM)} {name}" + last_tag
+                details = c(f"      Server: {url}   Key: {key_masked}   Model: {model}", Style.DIM)
+
+            print(f"{pointer}{line_title}")
+            print(details)
+            print()
+
+        print(c("  ────────────────────────────────────────────────────────────────────────────", Style.DIM))
+        print(
+            f"  {c('[Enter]', Style.GREEN, Style.BOLD)} Launch   "
+            f"{c('[a / +]', Style.CYAN, Style.BOLD)} Add New   "
+            f"{c('[e]', Style.YELLOW, Style.BOLD)} Edit   "
+            f"{c('[m]', Style.MAGENTA, Style.BOLD)} Pick/Test Model   "
+            f"{c('[d]', Style.RED, Style.BOLD)} Delete   "
+            f"{c('[q]', Style.DIM, Style.BOLD)} Quit"
+        )
+        print(c("  ────────────────────────────────────────────────────────────────────────────", Style.DIM))
+
+        if status_msg:
+            print(f"\n  {status_msg}")
+            status_msg = ""
+
+        key = read_key()
+
+        if key == "UP" or key == "k":
+            selected_idx = (selected_idx - 1) % len(profiles)
+        elif key == "DOWN" or key == "j":
+            selected_idx = (selected_idx + 1) % len(profiles)
+        elif key == "ENTER":
+            launch_claude(store, profiles[selected_idx], extra_args)
+            return
+        elif key in ("a", "A", "+", "n", "N"):
+            clear_screen()
+            new_p = add_profile_flow(store)
+            if new_p:
+                selected_idx = len(store["profiles"]) - 1
+                ans = prompt_input("Launch Claude with this new profile now? (Y/n)", default="y")
+                if ans.lower() in ("y", "yes", ""):
+                    launch_claude(store, new_p, extra_args)
+                    return
+        elif key in ("e", "E"):
+            clear_screen()
+            edit_profile_flow(store, profiles[selected_idx])
+        elif key in ("m", "M", "t", "T"):
+            clear_screen()
+            target = profiles[selected_idx]
+            print(f"\n  {c('Profile:', Style.BOLD)} {target['name']} ({target['server_url']})")
+            chosen = choose_model_interactive(
+                target["server_url"], target["api_key"], current_model=target.get("model", "")
+            )
+            target["model"] = chosen
+            target["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            save_store(store)
+            status_msg = c(f"✓ Updated model for '{target['name']}': {chosen or '(default)'}", Style.GREEN)
+        elif key in ("d", "D", "x", "X"):
+            if delete_profile_flow(store, profiles[selected_idx]):
+                status_msg = c("✓ Profile deleted.", Style.GREEN)
+        elif key in ("q", "Q", "ESC"):
+            print(c("\n  Exited.", Style.DIM))
+            sys.exit(0)
+        elif key.isdigit() and key != "0":
+            num = int(key) - 1
+            if 0 <= num < len(profiles):
+                selected_idx = num
+                launch_claude(store, profiles[selected_idx], extra_args)
+                return
+
+
+# ─── CLI Entrypoint ──────────────────────────────────────────────────────────
+def print_help() -> None:
+    print(
+        f"""{c('claude-litellm', Style.BOLD, Style.CYAN)} — Isolated LiteLLM Profile Manager & Launcher for Claude Code
+
+{c('Usage:', Style.BOLD)}
+  claude-litellm                       Open interactive profile selector & manager TUI
+  claude-litellm [claude-args...]      Select profile and forward arguments to claude (e.g. -c, -r)
+  claude-litellm --last | -l           Launch immediately with the last used profile
+  claude-litellm --profile | -P <name> Launch immediately with a specific profile name or number
+  claude-litellm --add                 Add a new LiteLLM profile
+  claude-litellm --edit                Edit an existing profile
+  claude-litellm --list                List all saved profiles
+  claude-litellm --help | -h           Show this help message
+
+{c('Isolation Guarantees:', Style.BOLD)}
+  • Saved profiles : {c(str(PROFILES_FILE), Style.DIM)} (chmod 600)
+  • Isolated config: {c(str(ENVS_DIR / '<profile-id>'), Style.DIM)} (per-profile CLAUDE_CONFIG_DIR)
+  • Leaves your primary {c('~/.claude', Style.DIM)} configuration and standard {c('claude', Style.DIM)} CLI completely untouched.
+"""
+    )
+
+
+def main() -> None:
+    store = load_store()
+    args = sys.argv[1:]
+
+    if args and args[0] in ("-h", "--help"):
+        print_help()
+        return
+
+    if args and args[0] == "--list":
+        profiles = store.get("profiles", [])
+        if not profiles:
+            print("No saved profiles. Run 'claude-litellm --add' to create one.")
+            return
+        for idx, p in enumerate(profiles, 1):
+            last = " ★" if p.get("id") == store.get("last_used_id") else ""
+            print(
+                f"{idx}. {p.get('name')} | {p.get('server_url')} | Key: {mask_key(p.get('api_key', ''))} | Model: {p.get('model') or '-'}{last}"
+            )
+        return
+
+    if args and args[0] == "--add":
+        add_profile_flow(store)
+        return
+
+    if args and args[0] == "--edit":
+        profiles = store.get("profiles", [])
+        if not profiles:
+            add_profile_flow(store)
+            return
+        edit_profile_flow(store, profiles[0])
+        return
+
+    if args and args[0] in ("-l", "--last"):
+        profiles = store.get("profiles", [])
+        if not profiles:
+            interactive_menu(store, args[1:])
+            return
+        last_id = store.get("last_used_id")
+        target = next((p for p in profiles if p.get("id") == last_id), profiles[0])
+        launch_claude(store, target, args[1:])
+        return
+
+    if args and args[0] in ("--profile", "-P") and len(args) >= 2:
+        query = args[1]
+        rest = args[2:]
+        profiles = store.get("profiles", [])
+        target = None
+        if query.isdigit():
+            idx = int(query) - 1
+            if 0 <= idx < len(profiles):
+                target = profiles[idx]
+        if not target:
+            target = next(
+                (p for p in profiles if p.get("name", "").lower() == query.lower() or p.get("id") == query),
+                None,
+            )
+        if not target:
+            print(c(f"Error: Profile '{query}' not found.", Style.RED))
+            sys.exit(1)
+        launch_claude(store, target, rest)
+        return
+
+    try:
+        interactive_menu(store, args)
+    except KeyboardInterrupt:
+        print(c("\n  Cancelled.", Style.DIM))
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
